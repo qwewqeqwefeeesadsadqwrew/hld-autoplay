@@ -1,47 +1,40 @@
 /* ============================================================
-   hld patch shell  v2.1
+   补丁壳 · 通用模板（页面 hook 版）
    ------------------------------------------------------------
-   This repo only ships our own code. Game assets and scripts are
-   pulled from the official CDN at runtime and patched in memory
-   right before they execute.
+   用途：把官方 CDN 上的游戏脚本「现拉现改」，让它在自己域名下也能跑。
+   配合 assets/index.html 使用：index.html 先引 hook.js，再引官方启动脚本。
 
-   Three locks live inside the official scripts:
+   换一个游戏要改的只有下面 CFG 和后三个 NEEDLE 常量，
+   怎么求这三个锚点见 references/hosting.md 的「换游戏怎么套」。
 
-   1) Domain lock
-        if(!_0xXXXX){var _0xYYYY=new RegExp('...   ->   if(!1){...
-      Present in all 13 bundle scripts and in the boot script
-      s.92281.js. Left alone the page navigates to about:blank.
-
-   2) Engine decrypt key
-        SASE.decrypt(n, location.hostname)  ->  SASE.decrypt(n, 'static.zuiqiangyingyu.net')
-      The config payloads are encrypted with the official hostname
-      as the key, so the engine must see that exact string.
-
-   3) Anti-devtools guard (FuckDevtool) in the boot script
-        ...'threshold':0x64})['\x69\x6e\x69\x74']();...
-      Only the call itself is dropped, the config object stays.
-      Mobile address bars change the viewport size and can trip it.
-      NOTE: the file contains four more ['\x69\x6e\x69\x74']() sites
-      (a class method and real calls) - matching on the threshold
-      anchor keeps them untouched. Matching them broke the script
-      with "SyntaxError: Unexpected identifier".
-
-   Patched scripts are cached in CacheStorage so a reload does not
-   recompute anything. Bump CACHE_NAME whenever a rule changes.
+   这个文件是 2026-10-06《快乐小日子》上线版（v2.1）的实跑版本，
+   已逐字节比对验证过，改完记得把 CFG.cacheName 的版本号 +1。
    ============================================================ */
+
+var CFG = {
+  // 官方 CDN 目录（index.html 里的 <base> 也必须是它）
+  cdn: 'https://static.zuiqiangyingyu.net/wb_webview/happylittledays/h5/',
+  // 改任何规则都要 +1，否则用户浏览器里那份旧补丁会被一直复用
+  cacheName: 'hld-patch-v3',
+  // 三类脚本：引擎 / 启动脚本 / 分包
+  engineRe: /\/cocos2d-js-min[a-z0-9.]*\.js(\?|#|$)/,
+  bootRe: /\/s\.[0-9a-f]+\.js(\?|#|$)/,
+  bundleRe: /\/assets\/[^\/]+\/index\.[0-9a-f]+\.js(\?|#|$)/,
+  // 引擎里要写死的官方域名（config 拿它当解密密钥）
+  hostKey: 'static.zuiqiangyingyu.net'
+};
+
 (function () {
-  var CDN_PREFIX = 'https://static.zuiqiangyingyu.net/wb_webview/happylittledays/h5/';
-  var TARGET_RE = /(\/assets\/[^\/]+\/index\.[0-9a-f]+\.js|\/s\.[0-9a-f]+\.js|\/cocos2d-js-min[a-z0-9.]*\.js)(\?|#|$)/;
-  var ENGINE_RE = /\/cocos2d-js-min[a-z0-9.]*\.js(\?|#|$)/;
-  var BOOT_RE = /\/s\.[0-9a-f]+\.js(\?|#|$)/;
-  var CACHE_NAME = 'hld-patch-v3';
+  var CDN_PREFIX = CFG.cdn;
+  var CACHE_NAME = CFG.cacheName;
+  var engineRe = CFG.engineRe, bootRe = CFG.bootRe, bundleRe = CFG.bundleRe;
   var mem = Object.create(null);
 
   function isTarget(abs) {
-    return abs.indexOf(CDN_PREFIX) === 0 && TARGET_RE.test(abs);
+    return abs.indexOf(CDN_PREFIX) === 0 && (engineRe.test(abs) || bootRe.test(abs) || bundleRe.test(abs));
   }
 
-  // ---- byte helpers ----
+  // ---- 字节工具 ----
   function bytes(str) {
     var u = new Uint8Array(str.length);
     for (var i = 0; i < str.length; i++) u[i] = str.charCodeAt(i) & 0xff;
@@ -56,15 +49,18 @@
 
   var ONE = new Uint8Array([49]); // '1'
 
-  // rule 3 anchor: the escaped "threshold" key + '0x64})' + the guard call
+  // 锁 3 锚点：反调试守卫。必须带上下文！
+  // 裸串 ['\x69\x6e\x69\x74']() 在本例里有 5 处，只有 1 处是守卫，
+  // 按裸串删会误伤真代码 → SyntaxError: Unexpected identifier。
+  // 下面这串是「'threshold':0x64}) + 守卫调用」，换游戏按 references/hosting.md 重新求。
   var NEEDLE_GUARD = bytes("\\x74\\x68\\x72\\x65\\x73\\x68\\x6f\\x6c\\x64':0x64})['\\x69\\x6e\\x69\\x74']();");
   var GUARD_REPL = bytes("\\x74\\x68\\x72\\x65\\x73\\x68\\x6f\\x6c\\x64':0x64});");
 
-  // rule 2 anchor
+  // 锁 2 锚点：引擎解密钥匙
   var NEEDLE_HOSTKEY = bytes(',location.hostname)');
-  var HOSTKEY_REPL = bytes(",'static.zuiqiangyingyu.net')");
+  var HOSTKEY_REPL = bytes(",'" + CFG.hostKey + "')");
 
-  // ---- patch in place ----
+  // ---- 就地改写 ----
   function patchBytes(u8, kind) { // kind: 'engine' | 'boot' | 'bundle'
     var n = u8.length, i = 0, last = 0, found = 0, parts = null;
 
@@ -72,7 +68,7 @@
     function cut(end) { begin(); parts.push(u8.subarray(last, end)); }
 
     while (i < n) {
-      // rule 2: engine decrypt key
+      // 锁 2：引擎解密钥匙
       if (kind === 'engine' && startsWith(u8, i, NEEDLE_HOSTKEY)) {
         cut(i);
         parts.push(HOSTKEY_REPL);
@@ -81,7 +77,7 @@
         i = last;
         continue;
       }
-      // rule 3: anti-devtools guard (anchored on the threshold config)
+      // 锁 3：反调试守卫（带上下文锚点）
       if (kind === 'boot' && startsWith(u8, i, NEEDLE_GUARD)) {
         cut(i);
         parts.push(GUARD_REPL);
@@ -90,7 +86,7 @@
         i = last;
         continue;
       }
-      // rule 1: domain lock  if(!_0xXXXX){var _0xYYYY=new RegExp('  ->  if(!1){
+      // 锁 1：域名锁  if(!_0xXXXX){var _0xYYYY=new RegExp('  ->  if(!1){
       if (u8[i] === 105 && u8[i + 1] === 102 && u8[i + 2] === 40 && u8[i + 3] === 33 &&
           u8[i + 4] === 95 && u8[i + 5] === 48 && u8[i + 6] === 120) {
         var j = i + 7;
@@ -104,9 +100,9 @@
               u8[k] === 61 && u8[k + 1] === 110 && u8[k + 2] === 101 && u8[k + 3] === 119 && u8[k + 4] === 32 &&
               u8[k + 5] === 82 && u8[k + 6] === 101 && u8[k + 7] === 103 && u8[k + 8] === 69 &&
               u8[k + 9] === 120 && u8[k + 10] === 112 && u8[k + 11] === 40 && u8[k + 12] === 39) {
-            cut(i + 4);   // keep "if(!"
+            cut(i + 4);   // 保留 "if(!"
             parts.push(ONE);
-            last = j;     // resume at ")"
+            last = j;     // 从 ")" 继续
             found++;
             i = k + 13;
             continue;
@@ -121,12 +117,12 @@
   }
 
   function kindOf(url) {
-    if (ENGINE_RE.test(url)) return 'engine';
-    if (BOOT_RE.test(url)) return 'boot';
+    if (engineRe.test(url)) return 'engine';
+    if (bootRe.test(url)) return 'boot';
     return 'bundle';
   }
 
-  // advisory syntax check - logs a warning, never changes behaviour
+  // 只报警不改行为的语法自检：改坏了能在控制台一眼看到
   function sanityCheck(ab, url) {
     try {
       new Function(new TextDecoder('utf-8').decode(ab));
@@ -182,7 +178,7 @@
     });
   }
 
-  // ---- intercept <script src>, swap in the patched blob ----
+  // ---- 劫持 <script src>，命中就换成补丁后的 blob ----
   var proto = window.HTMLScriptElement && window.HTMLScriptElement.prototype;
   if (proto) {
     var d = Object.getOwnPropertyDescriptor(proto, 'src');
