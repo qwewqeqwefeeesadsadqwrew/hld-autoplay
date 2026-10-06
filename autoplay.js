@@ -542,7 +542,7 @@
     HL.findAll('Level-32004').forEach(function (c) { try { if (HL.clsName(c) === 'Level-32004') C = c; } catch (e) {} });
     if (!C) return 'no C(-32004)';
     if (window.__L3P && window.__L3P.timer) { clearInterval(window.__L3P.timer); window.__L3P.timer = null; }
-    var P = window.__L3P = { log: [], t0: Date.now(), done: false, busyUntil: 0, lastK: 0, tries: 0, act: 0, nextAt: 0, falls: 0 };
+    var P = window.__L3P = { log: [], t0: Date.now(), done: false, busyUntil: 0, lastK: 0, tries: 0, act: 0, nextAt: 0, falls: 0, cutKey: '' };
 
     function L() {
       var a = [].slice.call(arguments);
@@ -554,6 +554,12 @@
     function comp(k) { try { return !!(C.partInfo[k] && C.partInfo[k].completed); } catch (e) { return false; } }
     function stateOk() { try { return C.state === 3; } catch (e) { return false; } }   // 3 = waitTouch
     function tipOf(k) { try { return ((C._touchList || [])[k - 1] || {}).tips || ''; } catch (e) { return ''; } }
+    // 切菜进度信号：《牛排》关卡自带的刀数计数器（拖上菜板 caibanFoodId 变化、每点一刀 curCuttingTimes+1）
+    function cutKey() {
+      try {
+        return (C.caibanIsHasFood ? 1 : 0) + '|' + C.caibanFoodId + '|' + C.curCuttingTimes + '|' + C.totalCuttingTimes;
+      } catch (e) { return 'cutErr'; }
+    }
     function doneCount() { var c = 0; for (var i = 1; i <= 45; i++) if (comp(i)) c++; return c; }
     function snap() {
       try {
@@ -761,6 +767,7 @@
       }
       if (P.lastK !== k) {                       // 新步骤：拟人停顿 1~3 秒
         P.lastK = k; P.act = 0; P.tries = 0;
+        P.cutKey = '';
         P.nextAt = t + 1000 + Math.random() * 2000;
         L('→ 第' + k + '步 ' + tipOf(k) + ' | ' + snap());
         return;
@@ -768,8 +775,13 @@
       if (t < P.nextAt) return;
       var list = PLAN[k];
       if (!list) { fallback(k); return; }
+      var isCut = (list[0] && list[0].t === 'cut');
+      if (isCut) {                               // 切菜步：刀数有进展就不算失败（游戏吞刀也不误判）
+        var ck = cutKey();
+        if (ck !== P.cutKey) { P.cutKey = ck; P.tries = 0; }
+      }
       P.tries++;
-      if (P.tries > 8) { fallback(k); return; }
+      if (P.tries > (isCut ? 14 : 8)) { fallback(k); return; }
       var spec = list[P.act % list.length];
       P.act++;
       var r = ''; try { r = doAct(k, spec, P.tries) || ''; } catch (e) { r = 'ERR ' + e.message; }
