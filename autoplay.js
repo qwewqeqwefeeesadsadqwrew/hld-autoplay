@@ -18,8 +18,8 @@
    结构：
      · 工具层：__HLD__（类名 / 场景查找，驱动脚本依赖）
      · 流程层：成功弹窗、失败弹窗、开场卡、菜单选关、关卡切换、卡死兜底
-     · 驱动层：第 1-3 关用游戏自身 partAnim 播步骤动画；
-              第 4-10 关用逐关手势驱动（构建时逐字拼在文件尾部）
+     · 驱动层：第 3 关（牛排）起逐关手势驱动（构建时逐字拼在文件尾部）；
+              没有专用驱动的低关仍用游戏自身 partAnim 播步骤动画兜底
    注意：交付文件 autoplay/autoplay.js 由 probe/build_autoplay.js 生成。
         改流程 → 改本文件；改单关 → 改 probe/expr_lvNplay.js，然后重新构建。
    ============================================================ */
@@ -213,8 +213,9 @@
     S.driver = null;
   }
 
-  // ---- 第 1-3 关：直接调用游戏自身的 partAnim（按步骤顺序播过关动画）----
-  var LOW_LEVELS = { 'Level-32295': 1, 'Level-31970': 1, 'Level-32004': 1 };
+  // ---- 低关兜底：直接调用游戏自身的 partAnim（按步骤顺序播过关动画）----
+  // 注：Level-32004（牛排）已换成专用手势驱动 probe/expr_lv3play.js
+  var LOW_LEVELS = { 'Level-32295': 1, 'Level-31970': 1 };
   // 通用兜底：关卡池是动态抽取的，凡是带 partAnim+partInfo 的关卡都能用同一套驱动
   function canPartAnim(inst) {
     try {
@@ -297,6 +298,7 @@
     return true;
   }
   var DRIVER_G = {
+    'Level-32004': '__L3P',
     'Level-32002': '__L4P',
     'Level-31969': '__L5P',
     'Level-31957': '__L6P',
@@ -523,6 +525,259 @@
 (function () {
   var AP = window.__AUTOPLAY__;
   if (!AP) { return; }
+
+  /* ---- L3  牛排（Level-32004，源文件 expr_lv3play.js） ---- */
+  AP.drivers["Level-32004"] = function () {
+  // L3 牛排 (-32004) 自动玩驱动 —— 手势版（不是步骤动画直连）
+    // 依据（全部来自关卡源码 probe/steak_src_defrag.js 与实机验证）：
+    //   · 事件模型：initNodeEvent 给「带 move/click 子节点的方块」注册 touchstart/move/end；
+    //     touchstart 记录 startTouchPos；touchmove 把 getDelta() 直接加到节点位置；
+    //     touchend → handleTouchNode(target, event)，用 getLocation()-startTouchPos 判断滑动方向，
+    //     用 checkIsIntersection(节点包围盒, area 的 PolygonCollider) 判断是否拖到位。
+    //   · 因此合成事件必须带 target/getID/getLocation/getDelta，且 __touch 位置要跟着手势走。
+    //   · 每步完成信号：C.partInfo[k].completed（游戏自己的 partAnim 在拖放成功后会置位）。
+    //   · 兜底：同一步连续多次手势没进展时，调用游戏自身的 partAnim(k)（和之前一致的通关保障）。
+    var HL = window.__HLD__;
+    var C = null;
+    HL.findAll('Level-32004').forEach(function (c) { try { if (HL.clsName(c) === 'Level-32004') C = c; } catch (e) {} });
+    if (!C) return 'no C(-32004)';
+    if (window.__L3P && window.__L3P.timer) { clearInterval(window.__L3P.timer); window.__L3P.timer = null; }
+    var P = window.__L3P = { log: [], t0: Date.now(), done: false, busyUntil: 0, lastK: 0, tries: 0, act: 0, nextAt: 0, falls: 0 };
+
+    function L() {
+      var a = [].slice.call(arguments);
+      P.log.push(((Date.now() - P.t0) / 1000).toFixed(1) + 's ' + a.join(' '));
+      if (P.log.length > 1500) P.log.splice(0, 700);
+    }
+    function D(n) { return C.dict[n]; }
+    function act(n) { try { return !!(n && n.activeInHierarchy); } catch (e) { return false; } }
+    function comp(k) { try { return !!(C.partInfo[k] && C.partInfo[k].completed); } catch (e) { return false; } }
+    function stateOk() { try { return C.state === 3; } catch (e) { return false; } }   // 3 = waitTouch
+    function tipOf(k) { try { return ((C._touchList || [])[k - 1] || {}).tips || ''; } catch (e) { return ''; } }
+    function doneCount() { var c = 0; for (var i = 1; i <= 45; i++) if (comp(i)) c++; return c; }
+    function snap() {
+      try {
+        return JSON.stringify({
+          sc: C._curSceneIdx, st: C.state, d: doneCount(),
+          td: C.tdChanNum, lb: C.lbChanNum, fan: C.fanchaoNum,
+          cut: (C.caibanIsHasFood ? C.caibanFoodId : 0)
+        });
+      } catch (e) { return 'snapErr'; }
+    }
+
+    // ---------- 合成触摸（对齐游戏的事件模型）----------
+    var TOUCH_ID = 0x4C33;
+    var touch = cc.v2(0, 0), lastDelta = cc.v2(0, 0);
+    function mkEv(node) {
+      return {
+        target: node,
+        getID: function () { return TOUCH_ID; },
+        getLocation: function () { return cc.v2(touch.x, touch.y); },
+        getDelta: function () { return cc.v2(lastDelta.x, lastDelta.y); },
+        stopPropagation: function () {}, stopPropagationImmediate: function () {}
+      };
+    }
+    function worldOf(n) { return n.convertToWorldSpaceAR(cc.v2(0, 0)); }
+    function hasT(n, t) { try { return n.hasEventListener(t); } catch (e) { return false; } }
+    function beginTouch(n) { var w = worldOf(n); touch.x = w.x; touch.y = w.y; lastDelta = cc.v2(0, 0); n.emit('touchstart', mkEv(n)); }
+    function endTouch(n) { lastDelta = cc.v2(0, 0); n.emit('touchend', mkEv(n)); }
+    function areaCentroid(name) {
+      var a = D(name);
+      if (!a) return null;
+      var col = null;
+      try { col = a.getComponent(cc.PolygonCollider); } catch (e) { return null; }
+      if (!col || !col.points || !col.points.length) return null;
+      var pts;
+      try { pts = C.getWorldPoints(a, col.points); } catch (e) { return null; }
+      var sx = 0, sy = 0;
+      for (var i = 0; i < pts.length; i++) { sx += pts[i].x; sy += pts[i].y; }
+      return cc.v2(sx / pts.length, sy / pts.length);
+    }
+
+    // 拟人拖拽：按下微停 → 起手 → 中段快 → 落点减速，约 0.6~0.8 秒
+    var DRAG_HOLD = 80, DRAG_TICK = 38;
+    var DRAG_RATIO = [0.06, 0.10, 0.14, 0.18, 0.20, 0.20, 0.18, 0.16, 0.14, 0.12, 0.12, 0.14, 0.18, 0.25, 0.35, 1];
+    var JIT = [[0, 0], [0, 30], [0, -30], [30, 0], [-30, 0], [0, 60], [0, -60], [60, 0], [-60, 0], [0, 90], [0, -90], [90, 0], [-90, 0]];
+    function dragTo(nodeName, areaName, attempt) {
+      var n = D(nodeName), a = D(areaName);
+      if (!n) return 'missing ' + nodeName;
+      if (!act(n)) return 'inactive ' + nodeName;
+      if (!act(a)) return 'area inactive ' + areaName;
+      if (!hasT(n, 'touchstart')) return 'no listener ' + nodeName;
+      var cent = areaCentroid(areaName);
+      if (!cent) return 'no collider ' + areaName;
+      var j = JIT[(Math.max(1, attempt || 1) - 1) % JIT.length];
+      var world = cc.v2(cent.x + j[0], cent.y + j[1]);
+      var want = n.parent.convertToNodeSpaceAR(world);
+      beginTouch(n);
+      P.busyUntil = Date.now() + 1100;
+      var i = 0;
+      function tick() {
+        var cur = n.getPosition();
+        var rem = cc.v2(want.x - cur.x, want.y - cur.y);
+        if (i >= DRAG_RATIO.length || rem.mag() < 1.5) {
+          endTouch(n);
+          P.busyUntil = Date.now() + 300;
+          return;
+        }
+        var r = DRAG_RATIO[i]; i++;
+        var d = cc.v2(rem.x * r, rem.y * r);
+        lastDelta = d; touch.x += d.x; touch.y += d.y;
+        n.emit('touchmove', mkEv(n));
+        setTimeout(tick, DRAG_TICK + Math.random() * 8);
+      }
+      setTimeout(tick, DRAG_HOLD + Math.random() * 50);
+      return '拖 ' + nodeName + '→' + areaName + (attempt > 1 ? (' 第' + attempt + '次') : '');
+    }
+
+    // 滑动：滑动方向由 getLocation()-startTouchPos 判定（左滑 dx<-30 / 上滑 dy>30）
+    function swipe(nodeName, dx, dy) {
+      var n = D(nodeName);
+      if (!n) return 'missing ' + nodeName;
+      if (!act(n)) return 'inactive ' + nodeName;
+      if (!hasT(n, 'touchmove')) return 'no touchmove ' + nodeName;
+      var w = worldOf(n);
+      touch.x = w.x; touch.y = w.y; lastDelta = cc.v2(0, 0);
+      n.emit('touchstart', mkEv(n));
+      P.busyUntil = Date.now() + 900;
+      var steps = 5, k = 0;
+      function tick() {
+        if (k >= steps) { endTouch(n); P.busyUntil = Date.now() + 300; return; }
+        k++;
+        var d = cc.v2(dx / steps, dy / steps);
+        lastDelta = d; touch.x += d.x; touch.y += d.y;
+        n.emit('touchmove', mkEv(n));
+        setTimeout(tick, 30 + Math.random() * 10);
+      }
+      setTimeout(tick, 40 + Math.random() * 25);
+      return '滑 ' + nodeName + ' (' + dx + ',' + dy + ')';
+    }
+
+    // 点击：按下约 0.1 秒再抬起（游戏里有按压动画）
+    function tap(nodeName) {
+      var n = D(nodeName);
+      if (!n) return 'missing ' + nodeName;
+      if (!act(n)) return 'inactive ' + nodeName;
+      if (!hasT(n, 'touchend')) return 'no touchend ' + nodeName;
+      var w = worldOf(n);
+      touch.x = w.x; touch.y = w.y; lastDelta = cc.v2(0, 0);
+      n.emit('touchstart', mkEv(n));
+      P.busyUntil = Date.now() + 800;
+      setTimeout(function () {
+        try { endTouch(n); } catch (e) {}
+        P.busyUntil = Date.now() + 300;
+      }, 70 + Math.random() * 50);
+      return '点 ' + nodeName;
+    }
+
+    // ---------- 45 步计划（步骤 → 手势；依据 handleTouchNode 的 case 分支）----------
+    function dg(name, area) { return { t: 'drag', n: name, a: area }; }
+    function sw(name, dx, dy) { return { t: 'swipe', n: name, dx: dx, dy: dy }; }
+    function tp(name) { return { t: 'tap', n: name }; }
+    var PLAN = {
+      1:  [dg('moveBox_tiechan', 'area_tudou')],
+      2:  [dg('moveBox_tiechan', 'area_tudou')],
+      3:  [dg('moveBox_tiechan', 'area_luobo')],
+      4:  [dg('moveBox_tiechan', 'area_luobo')],
+      5:  [dg('moveBox_5', 'area_lanzi')],
+      6:  [dg('moveBox_6', 'area_lanzi')],
+      7:  [dg('moveBox_fanqie1', 'area_lanzi'), dg('moveBox_fanqie2', 'area_lanzi')],
+      8:  [dg('moveBox_8', 'area_lanzi')],
+      9:  [dg('moveBox_9', 'area_lanzi')],
+      10: [dg('moveBox_10', 'area_board')],
+      11: [dg('moveBox_11', 'area_board')],
+      12: [dg('moveBox_12', 'area_board')],
+      13: [sw('slideBox_13', 0, 300)],
+      14: [dg('moveBox_14', 'area_board')],
+      15: [dg('moveBox_15', 'area_board')],
+      16: [dg('moveBox_16', 'area_board')],
+      17: [dg('moveBox_17', 'area_board')],
+      // 18~23：先把菜拖到菜板，再点刀切（切够刀数游戏自动完成本步）
+      18: [{ t: 'cut', n: 'moveBox_18' }],
+      19: [{ t: 'cut', n: 'moveBox_19' }],
+      20: [{ t: 'cut', n: 'moveBox_20' }],
+      21: [{ t: 'cut', n: 'moveBox_21' }],
+      22: [{ t: 'cut', n: 'moveBox_22' }],
+      23: [{ t: 'cut', n: 'moveBox_23' }],
+      24: [tp('clickBox_24')],
+      25: [dg('moveBox_25', 'area_guo')],
+      26: [dg('moveBox_26', 'area_guo')],
+      27: [dg('moveBox_27', 'area_guo')],
+      28: [dg('moveBox_28', 'area_guo')],
+      29: [dg('moveBox_29', 'area_guo')],
+      30: [dg('moveBox_30', 'area_guo')],
+      31: [sw('slideBox_31', -300, 0)],
+      32: [dg('moveBox_32', 'area_diezi')],
+      33: [dg('moveBox_33', 'area_guo')],
+      34: [dg('moveBox_34', 'area_guo')],
+      35: [dg('moveBox_35', 'area_guo')],
+      36: [sw('slideBox_36', -300, 0)],
+      37: [dg('moveBox_37', 'area_diezi')],
+      38: [dg('moveBox_38', 'area_guo')],
+      39: [dg('moveBox_39', 'area_guo')],
+      40: [dg('moveBox_40', 'area_guo')],
+      41: [dg('moveBox_41', 'area_diezi')],
+      42: [tp('clickBox_42')],
+      43: [dg('moveBox_43', 'area_panzi')],
+      44: [dg('moveBox_44', 'area_panzi')],
+      45: [dg('moveBox_45', 'area_panzi')]
+    };
+    function doAct(step, spec, attempt) {
+      if (spec.t === 'drag') return dragTo(spec.n, spec.a, attempt);
+      if (spec.t === 'swipe') return swipe(spec.n, spec.dx, spec.dy);
+      if (spec.t === 'tap') return tap(spec.n);
+      if (spec.t === 'cut') {
+        // 菜在板上、刀亮着 → 点刀；否则先把菜拖到菜板
+        var onBoard = false;
+        try { onBoard = !!(C.caibanIsHasFood) && act(D('knifeBox3')); } catch (e) {}
+        if (onBoard) return tap('knifeBox3');
+        return dragTo(spec.n, 'area_board', attempt);
+      }
+      return 'unknown act';
+    }
+    function fallback(k) {
+      P.falls++;
+      var r = '';
+      try { C.partAnim(k); r = 'partAnim(' + k + ')'; } catch (e) { r = 'partAnim ERR ' + e.message; }
+      L('第' + k + '步手势多次未过 → 兜底 ' + r);
+      P.tries = 0; P.act = 0;
+      P.nextAt = Date.now() + 2200 + Math.random() * 800;
+    }
+
+    // ---------- 主循环 ----------
+    P.nextAt = Date.now() + 1200 + Math.random() * 1800;   // 进关先看一眼再动手（拟人）
+    P.timer = setInterval(function () {
+      if (P.done) return;
+      var t = Date.now();
+      if (t - P.t0 > 900000) { L('GLOBAL TIMEOUT'); P.done = true; clearInterval(P.timer); P.timer = null; return; }
+      if (P.busyUntil && t < P.busyUntil) return;
+      if (!stateOk()) return;                    // 游戏正在播动画/过场，等它回到「等待操作」
+      var k = 0;
+      for (var i = 1; i <= 45; i++) { if (!comp(i)) { k = i; break; } }
+      if (!k) {
+        L('45 步全部完成 ✓ | ' + snap());
+        P.done = true; clearInterval(P.timer); P.timer = null;
+        return;
+      }
+      if (P.lastK !== k) {                       // 新步骤：拟人停顿 1~3 秒
+        P.lastK = k; P.act = 0; P.tries = 0;
+        P.nextAt = t + 1000 + Math.random() * 2000;
+        L('→ 第' + k + '步 ' + tipOf(k) + ' | ' + snap());
+        return;
+      }
+      if (t < P.nextAt) return;
+      var list = PLAN[k];
+      if (!list) { fallback(k); return; }
+      P.tries++;
+      if (P.tries > 8) { fallback(k); return; }
+      var spec = list[P.act % list.length];
+      P.act++;
+      var r = ''; try { r = doAct(k, spec, P.tries) || ''; } catch (e) { r = 'ERR ' + e.message; }
+      L('第' + k + '步 ' + r);
+      P.nextAt = t + 900 + Math.random() * 900;  // 连续动作之间 0.9~1.8 秒
+    }, 250);
+    return 'lv3 steak player installed: 45 steps | start=' + snap();
+  };
 
   /* ---- L4  沙威玛（Level-32002，源文件 expr_lv4play4.js） ---- */
   AP.drivers["Level-32002"] = function () {
